@@ -53,19 +53,6 @@ def get_z3_formulization(p4_file: Path, out_dir=OUT_DIR):
     p4_package = p4py_module(prog_ctx)
     return p4_package
 
-
-# def print_z3_data(pipe_name, pipe_val):
-#     z3_datatype: z3.DatatypeRef
-#     p4_state: P4State
-#     z3_datatype, p4_state, pipe_cls = pipe_val
-#     with AI:
-#         AI.execute(
-#             """
-#             Print info of
-#             """
-#         )
-
-
 def get_flat_members(names):
     flat_members = []
     for name, p4z3_obj in names:
@@ -123,14 +110,6 @@ def print_z3_data(pipe_name, pipe_val):
         zipped_list = zip(flat_members, inputs, outputs)
         table = tabulate(zipped_list, headers=["NAME", "INPUT", "OUTPUT"])
         log.info("PIPE %s:\n%s\n", pipe_name, table)
-    # log.info("%-20s %-20s %-20s" % ("NAME", "INPUT", "OUTPUT"))
-    # log.info("-" * 60)
-    # w = max([max(len(str(x)) for x in col) for col in zipped_list])
-    # zipped_list = zip(flat_members, inputs, outputs)
-    # for name, input, output in zipped_list:
-    #     row = f"{name: <{w}} {str(input): <{w}} {str(output): <{w}}"
-    #     log.info(row)
-
 
 def main(args):
     start_time = datetime.now()
