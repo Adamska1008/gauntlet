@@ -99,6 +99,22 @@ def run_p4_to_py(p4_file, py_file):
 
 
 def list_passes(p4c_bin, p4_file, p4_dmp_dir):
+    """
+    Extract and return the list of P4C compiler passes from verbose output.
+
+    This function runs the P4C compiler in verbose mode and parses the output
+    to extract the sequence of passes that were executed during compilation.
+    The pass names are filtered to include only major pass categories.
+
+    Args:
+        p4c_bin (str): Path to P4C compiler binary
+        p4_file (Path): Input P4 source file
+        p4_dmp_dir (Path): Directory where intermediate files were dumped
+
+    Returns:
+        List[str]: List of pass names extracted from compiler verbose output
+                   (e.g., ["FrontEnd", "MidEnd", "PassManager"])
+    """
     p4_pass_cmd = f"{p4c_bin} -v "
     # p4_pass_cmd += f"-o {p4_dmp_dir} "
     p4_pass_cmd += f"{p4_file} 2>&1 "
@@ -116,6 +132,22 @@ def list_passes(p4c_bin, p4_file, p4_dmp_dir):
 
 
 def gen_p4_passes(p4c_bin, p4_dmp_dir, p4_file):
+    """
+    Generate all P4 intermediate pass files for translation validation.
+
+    This function orchestrates the complete pipeline for generating intermediate
+    P4 representations that will be used for semantic equivalence checking.
+
+    Args:
+        p4c_bin (str): Path to P4C compiler binary
+        p4_dmp_dir (Path): Output directory for intermediate files
+        p4_file (Path): Input P4 source file
+
+    Returns:
+        List[Path]: Complete list of intermediate P4 file paths
+                   (e.g., [input-FrontEnd.p4, input-MidEnd.p4, ...])
+    """
+
     util.check_dir(p4_dmp_dir)
     # ignore the compiler output here, for now.
     result = generate_p4_dump(p4c_bin, p4_file, p4_dmp_dir)
@@ -132,6 +164,19 @@ def gen_p4_passes(p4c_bin, p4_dmp_dir, p4_file):
 
 
 def prune_passes(p4_passes):
+    """
+    Remove redundant intermediate passes to optimize validation performance.
+
+    This function eliminates compiler passes that don't change the program
+    by comparing file hashes between consecutive passes. This optimization
+    reduces the number of equivalence checks that need to be performed.
+
+    Args:
+        p4_passes (List[Path]): List of intermediate P4 file paths in execution order
+
+    Returns:
+        List[Path]: Pruned list containing only files that differ from their predecessor
+    """
     pruned_passes = []
 
     def sha256(fname):
@@ -155,6 +200,24 @@ def prune_passes(p4_passes):
 
 def validate_translation(p4_file, target_dir, p4c_bin,
                          allow_undef=False, dump_info=False):
+    """
+    Main validation function that orchestrates the complete P4 translation validation process.
+
+    This function implements the full pipeline for validating P4 compiler translation correctness
+    by generating intermediate representations, converting them to formal semantics, and
+    performing equivalence checking between consecutive compiler passes.
+
+    Args:
+        p4_file (Path): Input P4 source file to validate
+        target_dir (Path): Output directory for intermediate files and results
+        p4c_bin (str): Path to P4C compiler binary
+        allow_undef (bool): Whether to ignore changes in undefined behavior
+        dump_info (bool): Whether to generate detailed JSON report
+
+    Returns:
+        int: Exit code indicating validation result
+             (EXIT_SUCCESS, EXIT_FAILURE, EXIT_SKIPPED, etc.)
+    """
     info = INFO
 
     # customize the main info with the new information

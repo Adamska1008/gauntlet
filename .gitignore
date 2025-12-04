@@ -140,3 +140,7 @@ tests/violated/**/*.py
 tests/undef_violated/**/*.py
 /tofino
 out.tofino/
+
+*.p4
+
+.lambdai

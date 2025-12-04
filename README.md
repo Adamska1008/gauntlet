@@ -3,17 +3,19 @@
 
 # The Gauntlet Tool Suite
 
-- [Requirements](#requirements)
-  * [Frameworks for Model-Based Testing](#frameworks-for-model-based-testing)
-- [Instructions](#instructions)
-  * [Generating a Random Program](#generating-a-random-program)
-  * [Retrieving Gauntlet Semantics for a P4 Program](#retrieving-gauntlet-semantics-for-a-p4-program)
-  * [Validating a P4C Program](#validating-a-p4c-program)
-  * [Model-Based Testing](#model-based-testing)
-  * [Fuzz-Testing at Scale](#fuzz-testing-at-scale)
-- [Fuzz-Testing Support Matrix](#fuzz-testing-support-matrix)
-- [Bugs Found in P4 Compilers](#bugs-found-in-p4-compilers)
-- [Citing This Project](#citing-this-project)
+- [The Gauntlet Tool Suite](#the-gauntlet-tool-suite)
+  - [Requirements](#requirements)
+    - [Frameworks for Model-based Testing](#frameworks-for-model-based-testing)
+  - [Instructions](#instructions)
+    - [Generating a Random Program](#generating-a-random-program)
+    - [Retrieving Gauntlet Semantics for a P4 Program](#retrieving-gauntlet-semantics-for-a-p4-program)
+    - [Validating a P4C Program](#validating-a-p4c-program)
+    - [Model-Based Testing](#model-based-testing)
+    - [Fuzz-Testing at Scale](#fuzz-testing-at-scale)
+  - [Fuzz-Testing Support Matrix](#fuzz-testing-support-matrix)
+  - [Bugs Found in P4 Compilers](#bugs-found-in-p4-compilers)
+  - [Citing This Project](#citing-this-project)
+  - [Build](#build)
 
 Gauntlet is a set of tools designed to find bugs in programmable data-plane compilers. More precisely, Gauntlet targets the
 [P4 language](https://p4.org/) ecosystem and  the P4-16 reference compiler ([p4c](https://github.com/p4lang/p4c/)).
@@ -120,4 +122,10 @@ To cite our work please refer to our paper:
   publisher = {{USENIX} Association},
   month = nov,
 }
+```
+
+## Build
+
+```
+sudo RUN_CI=ON ./do_install.sh
 ```
