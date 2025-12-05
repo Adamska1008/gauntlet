@@ -18,7 +18,7 @@ def is_valid_file(parser, arg):
         return Path(arg)
 
 
-def check_dir(directory):
+def check_dir(directory: Path):
     # create the folder if it does not exit
     if not directory == "" and not os.path.exists(directory):
         log.debug("Folder %s does not exist! Creating...", directory)
