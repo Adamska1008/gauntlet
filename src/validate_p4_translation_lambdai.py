@@ -8,7 +8,7 @@ import sys
 import time
 
 import p4z3.util as util
-import check_p4_pair as z3check
+import check_p4_pair_lambdai as z3check
 
 from lambdai import AI
 
