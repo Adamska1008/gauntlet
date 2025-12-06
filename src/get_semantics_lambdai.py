@@ -1,59 +1,67 @@
 import argparse
-from datetime import datetime
-import logging
 from pathlib import Path
-import time
-
-from p4z3.contrib.tabulate import tabulate
-from p4z3 import util
-from p4z3.state import StaticContext, P4ComplexType, P4Extern, P4State
-from p4z3.externs.core import core_externs
+import sys
+import importlib
+import logging
 import z3
 
+from p4z3.contrib.tabulate import tabulate
+from p4z3.state import StaticContext, P4ComplexType, P4Extern
+import p4z3.util as util
+from p4z3.externs.core import core_externs
 
-from lambdai import AI
+sys.setrecursionlimit(15000)
 
 FILE_DIR = Path(__file__).parent.resolve()
-P4Z3_BIN = FILE_DIR / "../modules/p4c/build/p4toz3"
-OUT_DIR = FILE_DIR / "../validated"
+P4Z3_BIN = FILE_DIR.joinpath("../modules/p4c/build/p4toz3")
+OUT_DIR = FILE_DIR.joinpath("../validated")
 log = logging.getLogger(__name__)
 
 
-def run_p4_to_py(p4_file, py_file):
-    cmd = f"{P4Z3_BIN} "
-    cmd += f"{p4_file} "
-    cmd += f"--output {py_file} "
-    return util.exec_process(cmd)
+def get_z3_formulization(p4_file, out_dir=OUT_DIR):
+    """Extract Z3 semantics from P4 file"""
 
-
-def get_py_module(prog_path: Path):
-    log.info("Getting py module from %s", prog_path)
-    function_name = "p4_program"
-    with AI:
-        module = AI.execute(
-            """
-            Find the module in the program in {prog_path} and 
-            extracts function {function_name} from the module.
-            """,
-            prog_path=prog_path,
-            function_name=function_name,
-        )
-    return module
-
-
-def get_z3_formulization(p4_file: Path, out_dir=OUT_DIR):
+    # Convert P4 to Python if needed
     if p4_file.suffix == ".p4":
         util.check_dir(out_dir)
-        py_file = out_dir / p4_file.with_suffix(".py").name
-        run_p4_to_py(p4_file, py_file)
+        py_file = out_dir.joinpath(p4_file.with_suffix(".py").name)
+        cmd = f"{P4Z3_BIN} {p4_file} --output {py_file}"
+        result = util.exec_process(cmd)
+
+        if result.returncode != util.EXIT_SUCCESS:
+            log.error("Failed to translate P4 to Python.")
+            return None, result.returncode
         p4_file = py_file
-    p4py_module = get_py_module(p4_file)
-    prog_ctx = StaticContext()
-    prog_ctx.add_extern_extensions(core_externs)
-    p4_package = p4py_module(prog_ctx)
-    return p4_package
+
+    # Import Python module
+    try:
+        ctrl_dir = p4_file.parent
+        ctrl_name = p4_file.stem
+        finder = importlib.machinery.PathFinder()
+        module_specs = finder.find_spec(str(ctrl_name), [str(ctrl_dir)])
+        module = module_specs.loader.load_module()
+        p4py_module = getattr(module, "p4_program")
+    except (ImportError, SyntaxError) as e:
+        log.error("Could not import the requested module: %s", e)
+        return None, util.EXIT_FAILURE
+
+    # Generate Z3 ASTs
+    log.info("Loading %s ASTs...", p4_file.name)
+    try:
+        prog_ctx = StaticContext()
+        prog_ctx.add_extern_extensions(core_externs)
+        p4_package = p4py_module(prog_ctx)
+        if not p4_package:
+            log.warning("No main module, nothing to evaluate!")
+            return None, util.EXIT_SKIPPED
+        return p4_package, util.EXIT_SUCCESS
+    except Exception:
+        log.exception("Failed to compile Python to Z3:\n")
+        return None, util.EXIT_FAILURE
+
 
 def get_flat_members(names):
+    """Flatten member names for display"""
     flat_members = []
     for name, p4z3_obj in names:
         if isinstance(p4z3_obj, P4ComplexType):
@@ -65,66 +73,38 @@ def get_flat_members(names):
 
 
 def reconstruct_input(pipe_name, p4_state, pipe_cls):
-    # these names are not quite accurate
+    """Reconstruct input state from P4 state"""
     if isinstance(pipe_cls, P4Extern):
         initial_state = z3.Const(f"{pipe_name}", pipe_cls.z3_type)
     else:
         prog_ctx = StaticContext()
         p4_state.initialize(prog_ctx)
         initial_state = p4_state.get_z3_repr(prog_ctx)
-
-    inital_inputs = initial_state.children()
-    return inital_inputs
-
-
-def handle_nested_ifs(pipe_name, flat_members, inputs, outputs):
-    cond = outputs[0]
-    then_outputs = outputs[1].children()
-    else_outputs = outputs[2].children()
-    if z3.z3util.is_app_of(outputs[1], z3.Z3_OP_ITE):
-        handle_nested_ifs(pipe_name, flat_members, inputs, then_outputs)
-    else:
-        zipped_list = zip(flat_members, inputs, then_outputs)
-        table = tabulate(zipped_list, headers=["NAME", "INPUT", "OUTPUT"])
-        log.info('PIPE %s Condition:\n"%s"\n%s\n', pipe_name, cond, table)
-        zipped_list = zip(flat_members, inputs, then_outputs)
-
-    if z3.z3util.is_app_of(outputs[2], z3.Z3_OP_ITE):
-        handle_nested_ifs(pipe_name, flat_members, inputs, else_outputs)
-    else:
-        zipped_list = zip(flat_members, inputs, else_outputs)
-        table = tabulate(zipped_list, headers=["NAME", "INPUT", "OUTPUT"])
-        log.info('PIPE %s Condition:\n"%s"\n%s\n', pipe_name, z3.Not(cond), table)
-        zipped_list = zip(flat_members, inputs, else_outputs)
+    return initial_state.children()
 
 
 def print_z3_data(pipe_name, pipe_val):
+    """Print Z3 data in tabular format"""
     z3_datatype, p4_state, pipe_cls = pipe_val
     z3_datatype = z3.simplify(z3_datatype)
+
     flat_members = get_flat_members(p4_state.members)
     inputs = reconstruct_input(pipe_name, p4_state, pipe_cls)
     outputs = z3_datatype.children()
-    if z3.z3util.is_app_of(z3_datatype, z3.Z3_OP_ITE):
-        handle_nested_ifs(pipe_name, flat_members, inputs, outputs)
-    else:
-        zipped_list = zip(flat_members, inputs, outputs)
-        table = tabulate(zipped_list, headers=["NAME", "INPUT", "OUTPUT"])
-        log.info("PIPE %s:\n%s\n", pipe_name, table)
+
+    zipped_list = zip(flat_members, inputs, outputs)
+    table = tabulate(zipped_list, headers=["NAME", "INPUT", "OUTPUT"])
+    log.info("PIPE %s:\n%s\n", pipe_name, table)
+
 
 def main(args):
-    start_time = datetime.now()
-    p4_input = Path(args.p4_input)
-    out_dir = Path(args.out_dir)
-    package = get_z3_formulization(p4_input, out_dir)
-    done_time = datetime.now()
-    elapsed = done_time - start_time
-    time_str = time.strftime(
-        "%H hours %M minutes %S seconds", time.gmtime(elapsed.total_seconds())
-    )
-    ms = elapsed.microseconds / 1000
-    log.info("Retrieving semantics took %s %s milliseconds.", time_str, ms)
-    for pipe_name, pipe_val in package.get_pipes().items():
-        print_z3_data(pipe_name, pipe_val)
+    package, result = get_z3_formulization(Path(args.p4_input), Path(args.out_dir))
+
+    if result == util.EXIT_SUCCESS:
+        for pipe_name, pipe_val in package.get_pipes().items():
+            print_z3_data(pipe_name, pipe_val)
+
+    return result
 
 
 if __name__ == "__main__":
@@ -133,43 +113,31 @@ if __name__ == "__main__":
         "-i",
         "--p4_input",
         dest="p4_input",
-        default=None,
-        type=lambda x: util.is_valid_file(parser, x),
-        help="The main input p4 file. This can either be a P4"
-        " program or the Python ToZ3 IR.",
+        required=True,
+        help="The main input p4 file.",
     )
     parser.add_argument(
         "-o",
         "--out_dir",
         dest="out_dir",
-        default=OUT_DIR,
+        default=str(OUT_DIR),
         help="Where intermediate output is stored.",
-    )
-    parser.add_argument(
-        "-l",
-        "--log_file",
-        dest="log_file",
-        default="semantics.log",
-        help="Specifies name of the log file.",
     )
     parser.add_argument(
         "-ll",
         "--log_level",
         dest="log_level",
         default="INFO",
-        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"],
+        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
         help="The log level to choose.",
     )
-    # Parse options and process argv
+
     arguments = parser.parse_args()
-    # configure logging
+
+    # Configure logging to console only
     logging.basicConfig(
-        filename=arguments.log_file,
         format="%(levelname)s:%(message)s",
-        level=getattr(logging, arguments.log_level),
-        filemode="w",
+        level=getattr(logging, arguments.log_level)
     )
-    stderr_log = logging.StreamHandler()
-    stderr_log.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
-    logging.getLogger().addHandler(stderr_log)
-    main(arguments)
+
+    sys.exit(main(arguments))

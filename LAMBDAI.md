@@ -22,7 +22,7 @@
 2.直接测试src/下脚本
 
 ```bash
-python3 src/get_semantics.py -i test_top.p4
+python3 src/get_semantics_lambdai.py -i test_top.p4
 python3 src/check_p4_pair.py --progs test_top.p4 test_top2.p4
 python3 src/validate_p4_translation.py -i test_top.p4
 python3 src/generate_p4_test_clean.py -i test_v1model.p4 -r
