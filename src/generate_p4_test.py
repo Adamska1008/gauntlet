@@ -458,9 +458,8 @@ def get_main_formula(config):
     return main_formula, pkt_range
 
 
-def build_test(config, main_formula, cond_tuple, pkt_range):
+def build_test(config, main_formula: z3.DatatypeRef, cond_tuple, pkt_range):
     permut_conds, avoid_conds, undefined_conds = cond_tuple
-
     # now we actually verify that we can find an input
     s = z3.Solver()
     # bind the output constant to the output of the main program
@@ -545,7 +544,6 @@ def perform_blackbox_test(config):
 
 
 def main(args):
-
     if args.randomize_input:
         seed = int.from_bytes(os.getrandom(8), "big")
         z3.set_param("smt.phase_selection", 5,
