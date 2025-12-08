@@ -1,422 +1,237 @@
 import argparse
 import logging
-import time
-import math
 import os
 import sys
 import itertools
 import signal
 from pathlib import Path
 
-
 import z3
 import p4z3.util as util
-from get_semantics import get_z3_formulization
-
 
 log = logging.getLogger(__name__)
 
 FILE_DIR = Path(__file__).parent.resolve()
 ROOT_DIR = FILE_DIR.parent
 P4Z3_BIN = ROOT_DIR.joinpath("modules/p4c/build/p4toz3")
-P4RANDOM_BIN = ROOT_DIR.joinpath("modules/p4c/build/p4bludgeon")
 OUT_DIR = ROOT_DIR.joinpath("validated")
 P4C_DIR = ROOT_DIR.joinpath("modules/p4c")
-TOFINO_DIR = ROOT_DIR.joinpath("tofino/bf_src")
 
-# signifies an invalid header
+# v1model constants - hardcoded
 INVALID_VAR = "invalid"
-# the main input header key word
 HEADER_VAR = "h"
+PIPE_NAME = "ig"
+INGRESS_VAR = "ig"
 
+from lambdai import AI
 
-def generate_p4_prog(p4c_bin, p4_file, config):
-    arch = config["arch"]
-    p4_cmd = f"{p4c_bin} "
-    p4_cmd += f"--output {p4_file} "
-    p4_cmd += f"--arch {arch} "
-    log.debug("Generating random p4 code with command %s ", p4_cmd)
-    return util.exec_process(p4_cmd), p4_file
+class P4SemanticsExtractor:
+    """Extract z3 semantics from p4 program (v1model only)"""
 
+    def __init__(self, out_dir):
+        self.out_dir = out_dir
+        self.logger = logging.getLogger(__name__)
 
-def run_p4_to_py(p4_file, py_file, config, option_str=""):
-    cmd = f"{P4Z3_BIN} "
-    cmd += f"{p4_file} "
-    cmd += f"--output {py_file} "
-    cmd += option_str
-    if config["arch"] == "tna":
-        include_dir = TOFINO_DIR.joinpath("install/share/p4c/p4include/ ")
-        cmd += f"-I {include_dir}"
-    log.info("Converting p4 to z3 python with command %s ", cmd)
-    return util.exec_process(cmd)
+    def extract_semantics(self, p4_file: Path):
+        """Extract z3 semantics from p4 program"""
+        py_file = self._convert_to_python(p4_file)
+        package = self._import_python_module(py_file)
+        return package.get_pipes()
 
+    def _convert_to_python(self, p4_file):
+        """Convert P4 file to Python using p4toz3 compiler"""
+        py_file = self.out_dir.joinpath(p4_file.with_suffix(".py").name)
 
-def fill_values(flat_input):
-    input_bits = []
-    for val in flat_input:
-        if isinstance(val, (z3.BitVecRef, z3.BoolRef)):
-            if isinstance(val, z3.BoolRef):
-                bitvec_val = 1 if z3.is_true(val) else 0
-                bitvec_width = 1
-            else:
-                bitvec_val = val.as_long()
-                bitvec_width = val.size()
-            input_bits.append(f"{bitvec_val:0{bitvec_width}b}")
+        cmd = f"{P4Z3_BIN} {p4_file} --output {py_file}"
+        self.logger.info("Converting p4 to z3 python with command %s", cmd)
+        result = util.exec_process(cmd)
+
+        if result.returncode != util.EXIT_SUCCESS:
+            self.logger.error("Failed to translate P4 to Python.")
+            raise RuntimeError(f"P4 to Python translation failed for {p4_file}")
+
+        return py_file
+
+    def _import_python_module(self, py_file):
+        """Load Python module and get Z3 formulation"""
+        from get_semantics import get_py_module, get_z3_asts
+
+        p4py_module = get_py_module(py_file)
+        if p4py_module is None:
+            raise RuntimeError(f"Could not import Python module from {py_file}")
+
+        package, result = get_z3_asts(p4py_module, py_file)
+        if result != util.EXIT_SUCCESS:
+            raise RuntimeError(f"Failed to generate Z3 ASTs from {py_file}")
+
+        return package
+
+class STFTestRunner:
+    """Handles running STF tests on P4 programs"""
+
+    def __init__(self, out_dir, p4_input):
+        self.out_dir = out_dir
+        self.p4_input = p4_input
+        self.logger = logging.getLogger(__name__)
+
+    def run_bmv2_test(self):
+        """Run BMv2 test on P4 program"""
+        cmd = f"python3 {P4C_DIR}/backends/bmv2/run-bmv2-test.py {P4C_DIR} -v -bd {P4C_DIR}/build {self.out_dir}/{self.p4_input.name}"
+        test_proc = util.start_process(cmd, cwd=self.out_dir)
+
+        def signal_handler(sig, frame):
+            self.logger.warning("run_bmv2_test: Caught Interrupt, exiting...")
+            os.kill(test_proc.pid, signal.SIGINT)
+            sys.exit(1)
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        stdout, stderr = test_proc.communicate()
+        return test_proc, stdout, stderr
+
+    def run_stf_test(self, stf_str):
+        """Run STF test with provided test string"""
+        self.logger.info("Running stf test on file %s", self.p4_input)
+
+        stf_file_name = self.out_dir.joinpath(f"{self.p4_input.stem}.stf")
+        with open(stf_file_name, 'w+') as stf_file:
+            stf_file.write(stf_str)
+
+        result, stdout, stderr = self.run_bmv2_test()
+
+        if result.returncode != util.EXIT_SUCCESS:
+            self.logger.error("Failed to validate %s with a stf test:")
+            self.logger.error("stdout: %s", stdout.decode("utf-8"))
+            self.logger.error("stderr: %s", stderr.decode("utf-8"))
+            return util.EXIT_FAILURE
         else:
-            raise RuntimeError(f"Type {type(val)} not supported!")
-    hex_str = ""
-    if input_bits:
-        bit_str = "".join(input_bits)
-        hex_str = "%0*X" % ((len(bit_str) + 3) // 4, int(bit_str, 2))
-    return hex_str
+            self.logger.info("Validation of %s with an stf test succeeded.", self.p4_input.name)
+            return util.EXIT_SUCCESS
 
-
-def convert_to_stf(input_values):
-    stf_lst = []
-    for val in input_values:
-        if isinstance(val, str):
-            stf_lst.extend(list(val))
-        else:
-            raise RuntimeError(f"Type {type(val)} not supported!")
-    return stf_lst
-
-
-def cleanup(procs):
-    for proc in procs:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-
-
-def save_error(err_path, stdout, stderr):
-    log.error("*" * 60)
-    log.error(stdout.decode("utf-8"))
-    log.error("*" * 60)
-    log.error(stderr.decode("utf-8"))
-    log.error("*" * 60)
-    util.check_dir(err_path.parent)
-    with open(f"{err_path}", 'w+') as err_file:
-        err_file.write(stdout.decode("utf-8"))
-        err_file.write(stderr.decode("utf-8"))
-
-
-def insert_spaces(text, dist):
-    return " ".join(text[i:i + dist] for i in range(0, len(text), dist))
-
-
-def overlay_dont_care_map(flat_output, dont_care_map):
-    out_pkt_list = list(fill_values(flat_output))
-    for idx, marker in enumerate(dont_care_map):
-        # this is an uninterpreted value, it can be anything
-        if marker == "*":
-            out_pkt_list[idx] = "*"
-        # this means that these bytes should be removed
-        # since the header is marked as invalid
-        elif marker == "x":
-            out_pkt_list[idx] = ""
-    return "".join(out_pkt_list)
-
-
+    
 def get_stf_str(flat_input, flat_output, dont_care_map):
-    # both the input and the output variable are then used to generate
-    # a stf file with an input and expected output packet on port 0
+    """Generate STF string from input and output"""
     log.info("Generating stf string...")
-    input_pkt_str = fill_values(flat_input)
-    output_pkt_str = overlay_dont_care_map(flat_output, dont_care_map)
 
-    stf_str = "packet 0 "
-    stf_str += insert_spaces(input_pkt_str, 2)
-    if output_pkt_str:
-        stf_str += "\nexpect 0 "
-        stf_str += insert_spaces(output_pkt_str, 2)
+    # Convert values to hex
+    def to_hex(values):
+        with AI:
+            formatted_bits = AI.execute(
+                """
+                For all values of z3 data type {values}, handle it one by one.
+                For z3.BoolRef, add 1 or 0 depending on whether it's true or not.
+                For z3.BitVecRef, convert to binary using the as_long method.
+
+                After getting a list of 0s and 1s, concatenate them and format as space-separated bytes: "00 01 10 11...".
+                Each byte should be 2 hex characters.
+                """, values=values,
+            )
+        return formatted_bits
+
+    dont_care_vals = set()
+    for val in flat_output:
+        if isinstance(val, (z3.BitVecRef, z3.BoolRef)):
+            for var in z3.z3util.get_vars(val):
+                str_val = str(var)
+                if str_val not in (INGRESS_VAR, INVALID_VAR):
+                    dont_care_vals.add(str_val)
+
+    # Generate STF output string using AI
+    with AI:
+        stf_str: str = AI.execute(
+            """
+            Generate STF test string from flat_input {flat_input}, flat_output {flat_output}, and dont_care_map {dont_care_map}:
+
+            1. Convert flat_input to hex string using the {to_hex} function approach
+            2. Convert flat_output to hex list using the <to_hex> function approach
+            3. Process output list with dont_care_map:
+               - For each marker at index i in dont_care_map:
+                 * If marker == "x": remove bytes at positions i*4 and i*4+2 from output list
+                 * If marker == "*": keep the bytes (no change)
+            4. Join remaining output list to create output_str
+            5. Create STF string:
+               - packet 0 <input_hex>
+               - expect 0 <output_hex> (only if output_str is not empty)
+
+            Return the complete STF string.
+            """, flat_input=flat_input, flat_output=flat_output, dont_care_map=dont_care_map, to_hex=to_hex
+        )
     return stf_str
 
-
-def get_prog_semantics(config):
-    p4_input = config["p4_input"]
-    out_dir = config["out_dir"]
-    py_file = Path(f"{out_dir}/{p4_input.stem}.py")
-    fail_dir = out_dir.joinpath("failed")
-
-    result = run_p4_to_py(p4_input, py_file, config)
-    if result.returncode != util.EXIT_SUCCESS:
-        log.error("Failed to translate P4 to Python.")
-        util.check_dir(fail_dir)
-        with open(f"{fail_dir}/error.txt", 'w+') as err_file:
-            err_file.write(result.stderr.decode("utf-8"))
-        util.copy_file([p4_input, py_file], fail_dir)
-        return None, result.returncode
-    package, result = get_z3_formulization(py_file)
-    pipe_val = package.get_pipes()
-    if result != util.EXIT_SUCCESS:
-        if fail_dir and result != util.EXIT_SKIPPED:
-            util.check_dir(fail_dir)
-            util.copy_file([p4_input, py_file], fail_dir)
-        return pipe_val, result
-    return pipe_val, util.EXIT_SUCCESS
-
-
-def run_bmv2_test(out_dir, p4_input, use_psa=False):
-    cmd = "python3 "
-    cmd += f"{P4C_DIR}/backends/bmv2/run-bmv2-test.py "
-    cmd += f"{P4C_DIR} -v "
-    if use_psa:
-        cmd += "-p "
-    cmd += f"-bd {P4C_DIR}/build "
-    cmd += f"{out_dir}/{p4_input.name} "
-    test_proc = util.start_process(cmd, cwd=out_dir)
-
-    def signal_handler(sig, frame):
-        log.warning("run_bmv2_test: Caught Interrupt, exiting...")
-        os.kill(test_proc.pid, signal.SIGINT)
-        sys.exit(1)
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    stdout, stderr = test_proc.communicate()
-    return test_proc, stdout, stderr
-
-
-def run_tofino_test(out_dir, p4_input, stf_file_name):
-    # we need to change the working directory
-    # tofino scripts make some assumptions where to dump files
-    prog_name = p4_input.stem
-    # we need to create a specific test dir in which we can run tests
-    test_dir = out_dir.joinpath("test_dir")
-    util.check_dir(test_dir)
-    util.copy_file(stf_file_name, test_dir)
-    template_name = test_dir.joinpath(f"{prog_name}.py")
-    # use a test template that runs stf tests
-    util.copy_file(f"{FILE_DIR}/tofino_test_template.py", template_name)
-
-    # initialize the target install
-    log.info("Building the tofino target...")
-    config_cmd = f"{TOFINO_DIR}/pkgsrc/p4-build/configure "
-    config_cmd += "--with-tofino --with-p4c=bf-p4c "
-    config_cmd += f"--prefix={TOFINO_DIR}/install "
-    config_cmd += f"--bindir={TOFINO_DIR}/install/bin "
-    config_cmd += f"P4_NAME={prog_name} "
-    config_cmd += f"P4_PATH={p4_input.resolve()} "
-    config_cmd += "P4_VERSION=p4-16 "
-    config_cmd += "P4_ARCHITECTURE=tna "
-    result = util.exec_process(config_cmd, cwd=out_dir)
-    if result.returncode != util.EXIT_SUCCESS:
-        return result, result.stdout, result.stderr
-    # create the target
-    make_cmd = f"make -C {out_dir} "
-    result = util.exec_process(make_cmd)
-    if result.returncode != util.EXIT_SUCCESS:
-        return result, result.stdout, result.stderr
-    # install the target in the tofino folder
-    make_cmd = f"make install -C {out_dir} "
-    result = util.exec_process(make_cmd)
-    if result.returncode != util.EXIT_SUCCESS:
-        return result, result.stdout, result.stderr
-    procs = []
-    test_proc = None
-    # start the target in the background
-    log.info("Starting the tofino model...")
-    os_env = os.environ.copy()
-    os_env["SDE"] = f"{TOFINO_DIR}"
-    os_env["SDE_INSTALL"] = f"{TOFINO_DIR}/install"
-
-    model_cmd = f"{TOFINO_DIR}/run_tofino_model.sh "
-    model_cmd += f"-p {prog_name} "
-    proc = util.start_process(
-        model_cmd, preexec_fn=os.setsid, env=os_env, cwd=out_dir)
-    procs.append(proc)
-    # start the binary for the target in the background
-    log.info("Launching switchd...")
-    os_env = os.environ.copy()
-    os_env["SDE"] = f"{TOFINO_DIR}"
-    os_env["SDE_INSTALL"] = f"{TOFINO_DIR}/install"
-
-    switch_cmd = f"{TOFINO_DIR}/run_switchd.sh "
-    switch_cmd += "--arch tofino "
-    switch_cmd += f"-p {prog_name} "
-    proc = util.start_process(
-        switch_cmd, preexec_fn=os.setsid, env=os_env, cwd=out_dir)
-    procs.append(proc)
-
-    # wait for a bit
-    time.sleep(2)
-    # finally we can run the test
-    log.info("Running the actual test...")
-    test_cmd = f"{TOFINO_DIR}/run_p4_tests.sh "
-    test_cmd += f"-t {test_dir} "
-    os_env = os.environ.copy()
-    os_env["SDE"] = f"{TOFINO_DIR}"
-    os_env["SDE_INSTALL"] = f"{TOFINO_DIR}/install"
-    # inserting this path is necessary for the tofino_test_template.py
-    os_env["PYTHONPATH"] = f"${{PYTHONPATH}}:{ROOT_DIR}"
-    test_proc = util.start_process(test_cmd, env=os_env, cwd=out_dir)
-
-    def signal_handler(sig, frame):
-        log.warning("run_tofino_test: Caught Interrupt, exiting...")
-        cleanup(procs)
-        os.kill(test_proc.pid, signal.SIGINT)
-        os.kill(test_proc.pid, signal.SIGTERM)
-        sys.exit(1)
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    stdout, stderr = test_proc.communicate()
-    cleanup(procs)
-    return test_proc, stdout, stderr
-
-
-def run_stf_test(config, stf_str):
-    out_dir = config["out_dir"]
-    p4_input = config["p4_input"]
-    log.info("Running stf test on file %s", p4_input)
-
-    fail_dir = out_dir.joinpath("failed")
-    stf_file_name = out_dir.joinpath(f"{p4_input.stem}.stf")
-    with open(stf_file_name, 'w+') as stf_file:
-        stf_file.write(stf_str)
-    if config["arch"] == "tna":
-        result, stdout, stderr = run_tofino_test(
-            out_dir, p4_input, stf_file_name)
-    elif config["arch"] == "v1model":
-        result, stdout, stderr = run_bmv2_test(out_dir, p4_input)
-    elif config["arch"] == "psa":
-        result, stdout, stderr = run_bmv2_test(out_dir, p4_input, use_psa=True)
-    else:
-        raise RuntimeError("Unsupported test arch \"%s\"!" % config["arch"])
-    if result.returncode != util.EXIT_SUCCESS:
-        log.error("Failed to validate %s with a stf test:", p4_input.name)
-        err_file = Path(f"{fail_dir}/{p4_input.stem}_error.txt")
-        save_error(err_file, stdout, stderr)
-    else:
-        log.info("Validation of %s with an stf test succeeded.", p4_input.name)
-    return result.returncode
-
-
-def assemble_dont_care_map(flat_list, dont_care_vals):
-
-    dont_care_bit_map = []
-    for var in flat_list:
-        if isinstance(var, (z3.BitVecRef, z3.BoolRef)):
-            if isinstance(var, z3.BoolRef):
-                bitvec_hex_width = 1
-            else:
-                bitvec_hex_width = var.size()
-            dont_care = False
-            for dont_care_val in dont_care_vals:
-                if dont_care_val in str(var):
-                    dont_care = True
-            if str(var) == INVALID_VAR:
-                bitvec_map = ["x"] * bitvec_hex_width
-            elif dont_care:
-                bitvec_map = ["*"] * bitvec_hex_width
-            else:
-                bitvec_map = ["."] * bitvec_hex_width
-            dont_care_bit_map.extend(bitvec_map)
-        else:
-            raise RuntimeError(f"Type {type(var)} not supported!")
-
-    dont_care_map = []
-    invalid_fwd = False
-    dont_care_fwd = False
-    count = 0
-    for var in dont_care_bit_map:
-        count += 1
-        if var == "x":
-            invalid_fwd = True
-        elif var == "*":
-            dont_care_fwd = True
-        if count % 4 == 0:
-            if invalid_fwd:
-                dont_care_map.append("x")
-            elif dont_care_fwd:
-                dont_care_map.append("*")
-            else:
-                dont_care_map.append(".")
-            dont_care_fwd = False
-            invalid_fwd = False
-            count = 0
-
-    return dont_care_map
-
-
-def get_dont_care_map(config, z3_input, pkt_range):
-    dont_care_vals = set()
-    for val in z3.z3util.get_vars(z3_input):
-        str_val = str(val)
-        # both of these strings are special
-        # ingress means it is a variable we have control over
-        # invalid means that there is no byte output
-        if str(val) not in (config["ingress_var"], INVALID_VAR):
-            dont_care_vals.add(str_val)
-    flat_input = z3_input.children()[pkt_range]
-    return assemble_dont_care_map(flat_input, dont_care_vals)
-
-
-# https://stackoverflow.com/questions/14141977/check-if-a-formula-is-a-term-in-z3py
-CONNECTIVE_OPS = [z3.Z3_OP_NOT, z3.Z3_OP_AND, z3.Z3_OP_OR, z3.Z3_OP_XOR,
-                  z3.Z3_OP_IMPLIES, z3.Z3_OP_IFF, z3.Z3_OP_ITE]
-REL_OPS = [z3.Z3_OP_EQ, z3.Z3_OP_LE, z3.Z3_OP_LT, z3.Z3_OP_GE, z3.Z3_OP_GT]
-ALL_OPS = CONNECTIVE_OPS + REL_OPS
-
-
 def get_branch_conditions(z3_formula):
+    """Extract branch conditions from Z3 formula"""
     conditions = set()
     if isinstance(z3_formula, z3.BoolRef):
-        # if z3_formula.decl().kind() in REL_OPS + CONNECTIVE_OPS:
-        # FIXME: This does not unroll if statements
-        # This could lead to conflicting formulas
-        if z3_formula.decl().kind() not in CONNECTIVE_OPS:
+        if z3_formula.decl().kind() not in [z3.Z3_OP_NOT, z3.Z3_OP_AND, z3.Z3_OP_OR, z3.Z3_OP_XOR,
+                                             z3.Z3_OP_IMPLIES, z3.Z3_OP_IFF, z3.Z3_OP_ITE]:
             conditions.add(z3_formula)
     for child in z3_formula.children():
-        sub_conds = get_branch_conditions(child)
-        conditions |= sub_conds
+        conditions |= get_branch_conditions(child)
     return conditions
 
-
 def compute_permutations(permut_conds):
+    """Compute permutations of conditions"""
     log.info("Computing permutations...")
-    # FIXME: This does not scale well...
-    # FIXME: This is a complete hack, use a more sophisticated method
-    permuts = [[f(var) for var, f in zip(permut_conds, x)]
-               for x in itertools.product([z3.Not, lambda x: x],
-                                          repeat=len(permut_conds))]
-    return permuts
+    return [[f(var) for var, f in zip(permut_conds, x)]
+            for x in itertools.product([z3.Not, lambda x: x], repeat=len(permut_conds))]
 
+def analyze_z3_formula(pipes):
+    """Analyze Z3 formula and return main formula, packet range, and conditions"""
+    main_formula, p4_state, _ = pipes[PIPE_NAME]
+    pkt_range = None
 
-def dissect_conds(config, conditions):
-    controllable_conds = []
-    avoid_conds = []
-    undefined_conds = []
-    for cond in conditions:
-        cond = z3.simplify(cond)
-        has_member = False
-        has_table_key = False
-        has_table_action = False
-        has_undefined_var = False
-        for cond_var in z3.z3util.get_vars(cond):
-            if config["ingress_var"] in str(cond_var):
-                has_member = True
-            elif "table_key" in str(cond_var):
-                has_table_key = True
-            elif "action" in str(cond_var):
-                has_table_action = True
-            else:
-                if "_valid" in str(cond_var):
-                    # let's assume that every input header is valid
-                    # we have no choice right now
-                    undefined_conds.append(cond_var)
-                else:
-                    # all keys must be false for now
-                    # FIXME: Some of them should be usable
-                    if isinstance(cond_var, z3.BitVecRef):
-                        undefined_conds.append(cond_var == 0)
-                    elif isinstance(cond_var, z3.BoolRef):
-                        undefined_conds.append(z3.Not(cond_var))
-                has_undefined_var = True
-        if has_member and not (has_table_key or has_table_action or has_undefined_var):
-            controllable_conds.append(cond)
-        elif has_undefined_var and not (has_table_key or has_table_action):
-            pass
-        else:
-            avoid_conds.append(cond)
+    # Find HEADER_VAR
+    for member_name, member_type in p4_state.members:
+        if member_name == HEADER_VAR:
+            pkt_range = slice(0, len(member_type.flat_names))
+            break
+
+    if not pkt_range:
+        log.error("No valid input formula found! Variable '%s' not found.", HEADER_VAR)
+        return None, None, []
+
+    main_formula = z3.simplify(main_formula)
+
+    # Get branch conditions
+    conditions = set()
+    for child in main_formula.children()[pkt_range]:
+        conditions |= get_branch_conditions(child)
+
+    return main_formula, pkt_range, conditions
+
+def dissect_conds(conditions):
+    """Dissect conditions for v1model"""
+    controllable_conds: list
+    avoid_conds: list
+    undefined_conds: list
+
+    with AI:
+        controllable_conds, avoid_conds, undefined_conds = AI.execute(
+            """
+            Analyze Z3 conditions {conditions} and categorize them for P4 test generation.
+
+            Task: For each condition in {conditions}, extract and categorize its variables:
+
+            1. Extract all variables from each condition using z3.z3util.get_vars()
+            2. Simplify each condition with z3.simplify()
+
+            Variable Analysis for each condition:
+            - has_member: variable name contains "{INGRESS_VAR}"
+            - has_table_key: variable name contains "table_key"
+            - has_table_action: variable name contains "action"
+            - has_undefined_var: variable is neither above AND:
+              * If variable name contains "_valid": add the variable itself to undefined_conds
+              * If variable is z3.BitVecRef: add (variable == 0) to undefined_conds
+              * If variable is z3.BoolRef: add z3.Not(variable) to undefined_conds
+
+            Condition Categorization:
+            - controllable_conds: has_member AND no (has_table_key OR has_table_action OR has_undefined_var)
+            - avoid_conds: has_table_key OR has_table_action OR (has_undefined_var AND not (has_table_key OR has_table_action))
+            - undefined_conds: collected from individual undefined variables as described above
+
+            Return: controllable_conds list, avoid_conds list, undefined_conds list
+            """, conditions=conditions, INGRESS_VAR=INGRESS_VAR
+        )
 
     permut_conds = compute_permutations(controllable_conds)
 
@@ -434,192 +249,164 @@ def dissect_conds(config, conditions):
 
     return permut_conds, avoid_conds, undefined_conds
 
-
-def get_main_formula(config):
-    # get the semantic representation of the original program
-    pipes, result = get_prog_semantics(config)
-    if result != util.EXIT_SUCCESS:
-        return result
-    # we currently ignore all other pipelines and focus on the ingress pipeline
-    main_formula, p4_state, _ = pipes[config["pipe_name"]]
-    pkt_range = None
-    idx = 0
-    # FIXME: Make this more robust, assume HEADER_VAR is always first
-    for member_name, member_type in p4_state.members:
-        if member_name == HEADER_VAR:
-            pkt_range = slice(idx, idx + len(member_type.flat_names))
-    if not pkt_range:
-        log.error("No valid input formula found!"
-                  " Check if your variable names are correct.")
-        log.error(
-            "This program checks for the \"%s\" variable in the pipe call.", HEADER_VAR)
-        return None, None
-    main_formula = z3.simplify(main_formula)
-    return main_formula, pkt_range
-
-
-def build_test(config, main_formula: z3.DatatypeRef, cond_tuple, pkt_range):
+def build_test(main_formula, cond_tuple, pkt_range):
+    """Build test case from Z3 formulas"""
     permut_conds, avoid_conds, undefined_conds = cond_tuple
-    # now we actually verify that we can find an input
+
     s = z3.Solver()
-    # bind the output constant to the output of the main program
     output_const = z3.Const("output", main_formula.sort())
     s.add(main_formula == output_const)
 
-    undefined_matches = z3.And(*undefined_conds)
-    s.add(undefined_matches)
+    s.add(z3.And(*undefined_conds))
+    s.add(z3.Not(z3.Or(*avoid_conds)))
 
-    avoid_matches = z3.Not(z3.Or(*avoid_conds))
-    s.add(avoid_matches)
-    # we need this tactic to find out which values will be undefined at the end
-    # or which headers we expect to be invalid
-    # the tactic effectively simplifies the formula to a single expression
-    # under the constraints we have defined
     t = z3.Then(
         z3.Tactic("propagate-values"),
         z3.Tactic("ctx-solver-simplify"),
         z3.Tactic("elim-and")
     )
-    # this is the test string we assemble
+
     stf_str = ""
     for permut in permut_conds:
         s.push()
         s.add(permut)
         log.info("Checking for solution...")
-        ret = s.check()
-        if ret == z3.sat:
-            log.info("Found a solution!")
-            # get the model
+        if s.check() == z3.sat:
             m = s.model()
-            # this does not work well yet... desperate hack
-            # FIXME: Figure out a way to solve this, might not be solvable
+            log.info("Found a solution!")
+
             g = z3.Goal()
             g.add(main_formula == output_const,
-                  avoid_matches, undefined_matches, z3.And(*permut))
-            log.debug(z3.tactics())
-            log.info("Inferring simplified input and output")
+                  z3.And(*undefined_conds), z3.Not(z3.Or(*avoid_conds)), z3.And(*permut))
+
             constrained_output = t.apply(g)
-            log.info("Inferring dont-care map...")
-            # FIXME: horrible
             output_var = constrained_output[0][0].children()[0]
-            dont_care_map = get_dont_care_map(config, output_var, pkt_range)
-            input_hdr = m[z3.Const(config["ingress_var"], output_const.sort())]
-            output_hdr = m[output_const]
-            log.debug("Output header: %s", output_hdr)
-            log.debug("Input header: %s", input_hdr)
-            flat_input = input_hdr.children()[pkt_range]
-            flat_output = output_hdr.children()[pkt_range]
-            stf_str += get_stf_str(flat_input, flat_output, dont_care_map)
+
+            # Get don't care map
+            dont_care_vals = set()
+            for val in z3.z3util.get_vars(output_var):
+                str_val = str(val)
+                if str_val not in (INGRESS_VAR, INVALID_VAR):
+                    dont_care_vals.add(str_val)
+
+            flat_input = m[z3.Const(INGRESS_VAR, output_const.sort())].children()[pkt_range]
+            flat_output = m[output_const].children()[pkt_range]
+
+            stf_str += get_stf_str(flat_input, flat_output, build_dont_care_map(flat_output, dont_care_vals))
             stf_str += "\n"
         else:
-            # FIXME: This should be an error
             log.warning("No valid input could be found!")
         s.pop()
-    # the final stf string lists all the interesting packets to test
+
     return stf_str
 
+def build_dont_care_map(flat_output, dont_care_vals):
+    """Build don't care map for output"""
+    with AI:
+        dont_care_map: list = AI.execute(
+            """
+            Given flat_output list {flat_output} of Z3 values and dont_care_vals set {dont_care_vals}, create a dont_care_map:
 
-def perform_blackbox_test(config):
-    out_dir = config["out_dir"]
-    p4_input = config["p4_input"]
-    if out_dir == OUT_DIR:
-        out_dir = out_dir.joinpath(p4_input.stem)
+            1. For each var in flat_output:
+               - If z3.BoolRef: width = 1, else if z3.BitVecRef: width = var.size()
+               - If str(var) == INVALID_VAR: extend dont_care_bit_map with ["x"] * width
+               - Elif any dont_care_val in str(var): extend with ["*"] * width
+               - Else: extend with ["."] * width
+
+            2. Group dont_care_bit_map into 8-bit chunks and create dont_care_map:
+               - If chunk contains "x": append "x"
+               - Elif chunk contains "*": append "*"
+               - Else: append "."
+
+            Return dont_care_map list.
+            """, flat_output=flat_output, dont_care_vals=dont_care_vals
+        )
+    return dont_care_map
+
+def perform_blackbox_test(out_dir, p4_input):
+    """Perform complete blackbox test"""
+    logger = logging.getLogger(__name__)
     util.check_dir(out_dir)
     util.copy_file(p4_input, out_dir)
-    config["out_dir"] = out_dir
-    config["p4_input"] = p4_input
+    semantics_extractor = P4SemanticsExtractor(out_dir)
+    test_runner = STFTestRunner(out_dir, p4_input)
 
-    main_formula, pkt_range = get_main_formula(config)
-    if main_formula == None or not pkt_range:
+    # Get program semantics
+    try:
+        pipes = semantics_extractor.extract_semantics(p4_input)
+    except Exception as e:
+        logger.error("Failed to extract P4 semantics: %s", str(e))
         return util.EXIT_FAILURE
-    conditions = set()
-    # FIXME: Another hack to deal with branch conditions we cannot control
-    for child in main_formula.children()[pkt_range]:
-        conditions |= get_branch_conditions(child)
-    cond_tuple = dissect_conds(config, conditions)
-    stf_str = build_test(config, main_formula, cond_tuple, pkt_range)
-    # finally, run the test with the stf string we have assembled
-    # and return the result of course
-    return run_stf_test(config, stf_str)
 
+    # Analyze main formula
+    main_formula, pkt_range, conditions = analyze_z3_formula(pipes)
+    if main_formula is None or not pkt_range:
+        return util.EXIT_FAILURE
 
-def main(args):
+    # Process conditions
+    cond_tuple = dissect_conds(conditions)
+
+    # Build test
+    stf_str = build_test(main_formula, cond_tuple, pkt_range)
+
+    # Run test
+    return test_runner.run_stf_test(stf_str)
+
+def main():
+    """Ultra-simplified main function - v1model + single file only"""
+    parser = argparse.ArgumentParser(description="P4 Test Generator - v1model architecture only")
+    parser.add_argument("-i", "--p4_input", dest="p4_input", required=True,
+                        help="Input P4 file path")
+    parser.add_argument("-o", "--out_dir", dest="out_dir", default=OUT_DIR,
+                        help="Output directory (default: validated)")
+    parser.add_argument("-r", "--randomize-input", dest="randomize_input",
+                        action='store_true',
+                        help="Randomize z3 input variables")
+    parser.add_argument("-l", "--log_file", dest="log_file",
+                        default="model.log",
+                        help="Log file name")
+    parser.add_argument("--log_level", dest="log_level",
+                        default="INFO",
+                        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+                        help="Log level")
+
+    args = parser.parse_args()
+
+    # Validate input file (single file only)
+    p4_input = Path(args.p4_input)
+    if not p4_input.exists():
+        print(f"Error: Input file {p4_input} does not exist")
+        sys.exit(1)
+
+    # Setup output directory
+    out_dir = Path(args.out_dir).joinpath(p4_input.stem)
+    util.del_dir(out_dir)  # Clean start for single file
+
+    # Setup logging
+    logging.basicConfig(
+        filename=Path(args.out_dir).joinpath(args.log_file),
+        format="%(levelname)s:%(message)s",
+        level=getattr(logging, args.log_level),
+        filemode='w'
+    )
+
+    # Also log to console
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
+    logging.getLogger().addHandler(console_handler)
+
+    # Randomize if requested
     if args.randomize_input:
         seed = int.from_bytes(os.getrandom(8), "big")
         z3.set_param("smt.phase_selection", 5,
                      "smt.random_seed", seed,
                      "smt.arith.random_initial_value", True,
-                     "sat.phase", "random",)
+                     "sat.phase", "random")
 
-    config = {}
-    config["arch"] = args.arch
-    if config["arch"] == "tna":
-        config["pipe_name"] = "pipe0_ingress"
-        config["ingress_var"] = "ingress"
-    elif config["arch"] == "v1model":
-        config["pipe_name"] = "ig"
-        config["ingress_var"] = "ig"
-    elif config["arch"] == "psa":
-        config["pipe_name"] = "ingress_ig"
-        config["ingress_var"] = "ig"
-    else:
-        raise RuntimeError("Unsupported test arch \"%s\"!" % config["arch"])
+    # Run test generation (single file only)
+    result = perform_blackbox_test(out_dir, p4_input)
 
-    if args.p4_input:
-        p4_input = Path(args.p4_input)
-        out_base_dir = Path(args.out_dir)
-    else:
-        out_base_dir = Path(args.out_dir).joinpath("rnd_test")
-        util.check_dir(out_base_dir)
-        p4_input = out_base_dir.joinpath("rnd_test.p4")
-        # generate a random program from scratch
-        generate_p4_prog(P4RANDOM_BIN, p4_input, config)
-
-    if os.path.isfile(p4_input):
-        out_dir = out_base_dir.joinpath(p4_input.stem)
-        util.del_dir(out_dir)
-        config["out_dir"] = out_dir
-        config["p4_input"] = p4_input
-        result = perform_blackbox_test(config)
-    else:
-        util.check_dir(out_base_dir)
-        for p4_file in list(p4_input.glob("**/*.p4")):
-            out_dir = out_base_dir.joinpath(p4_file.stem)
-            util.del_dir(out_dir)
-            config["out_dir"] = out_dir
-            config["p4_input"] = p4_file
-            result = perform_blackbox_test(config)
     sys.exit(result)
 
-
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--p4_input", dest="p4_input", default=None,
-                        type=lambda x: util.is_valid_file(parser, x),
-                        help="The main reference p4 file.")
-    parser.add_argument("-a", "--arch", dest="arch", default="v1model",
-                        type=str, help="Specify the back end to test.")
-    parser.add_argument("-o", "--out_dir", dest="out_dir", default=OUT_DIR,
-                        help="The output folder where all passes are dumped.")
-    parser.add_argument("-l", "--log_file", dest="log_file",
-                        default="model.log",
-                        help="Specifies name of the log file.")
-    parser.add_argument("-r", "--randomize-input", dest="randomize_input",
-                        action='store_true',
-                        help="Whether to randomize the z3 input variables.")
-    parser.add_argument("-ll", "--log_level", dest="log_level",
-                        default="INFO",
-                        choices=["CRITICAL", "ERROR", "WARNING",
-                                 "INFO", "DEBUG", "NOTSET"],
-                        help="The log level to choose.")
-    # Parse options and process argv
-    arguments = parser.parse_args()
-    # configure logging
-    logging.basicConfig(filename=arguments.log_file,
-                        format="%(levelname)s:%(message)s",
-                        level=getattr(logging, arguments.log_level),
-                        filemode='w')
-    stderr_log = logging.StreamHandler()
-    stderr_log.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
-    logging.getLogger().addHandler(stderr_log)
-    main(arguments)
+    main()
